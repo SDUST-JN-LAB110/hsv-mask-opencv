@@ -55,19 +55,21 @@ python3 tk_hsv_detector.py --camera 0 --process-scale 0.75 --center-region-ratio
 http://127.0.0.1:8000/get-offset-xy
 ```
 
-接口返回当前“最终最近框”在中央坐标系下的偏移量，例如：
+接口返回当前“最终最近框”在中央坐标系下的偏移量和偏移比例，例如：
 
 ```json
-{"x-offset":50,"y-offset":50}
+{"x-offset":50,"x-offset-rate":0.16,"y-offset":-50,"y-offset-rate":-0.21}
 ```
 
 如果当前没有最终最近框，接口返回：
 
 ```json
-{"x-offset":null,"y-offset":null}
+{"x-offset":null,"x-offset-rate":null,"y-offset":null,"y-offset-rate":null}
 ```
 
 可以用 `--api-host` 和 `--api-port` 修改接口监听地址。这个偏移量使用原始图像像素宽高计算，不使用 GUI 缩放后的显示尺寸，因此不同电脑窗口大小、屏幕分辨率不同，也不会改变同一输入画面下的偏移结果。
+
+偏移比例同样基于原始图像尺寸：x 轴边界是 `-画面宽度/2..画面宽度/2`，y 轴边界是 `-画面高度/2..画面高度/2`。例如 640x480 输入下，x 轴边界为 `-320..320`，y 轴边界为 `-240..240`；若中央坐标系偏移为 `(50, -50)`，比例为 `50/320=0.16` 和 `-50/240=-0.21`，保留两位小数。
 
 轻量 GUI 打开图片测试：
 
@@ -233,10 +235,12 @@ print("像素面积过滤后的矩形框:", result.filtered_rect_details)
 print("中心区域内的候选矩形框:", result.center_rect_details)
 print("最接近画面中心的矩形框:", result.closest_rect_details)
 print("中央坐标系偏移:", result.closest_offset_xy)
+print("中央坐标系偏移比例:", result.closest_offset_rate_xy)
 ```
 
 矩形框详情格式是 `(x, y, w, h, area)`，其中 `area = w * h`，单位是像素。
 中央坐标系偏移格式是 `(x, y)`，单位同样是原始图像像素；右和上为正，左和下为负。
+中央坐标系偏移比例格式是 `(x_rate, y_rate)`，按原始图像半宽和半高归一化后保留两位小数。
 
 ## 新增或修改图像处理流程
 

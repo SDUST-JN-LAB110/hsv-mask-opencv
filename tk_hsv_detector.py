@@ -197,28 +197,47 @@ class LatestQueue:
 class OffsetState:
     def __init__(self) -> None:
         self._offset_xy: Optional[tuple[int, int]] = None
+        self._offset_rate_xy: Optional[tuple[float, float]] = None
         self._lock = threading.Lock()
 
-    def set(self, offset_xy: Optional[tuple[int, int]]) -> None:
+    def set(
+        self,
+        offset_xy: Optional[tuple[int, int]],
+        offset_rate_xy: Optional[tuple[float, float]],
+    ) -> None:
         with self._lock:
             self._offset_xy = offset_xy
+            self._offset_rate_xy = offset_rate_xy
 
-    def get(self) -> Optional[tuple[int, int]]:
+    def get(self) -> tuple[Optional[tuple[int, int]], Optional[tuple[float, float]]]:
         with self._lock:
-            return self._offset_xy
+            return self._offset_xy, self._offset_rate_xy
 
-    def payload(self) -> dict[str, Optional[int]]:
-        offset_xy = self.get()
+    def payload(self) -> dict[str, object]:
+        offset_xy, offset_rate_xy = self.get()
         if offset_xy is None:
-            return {"x-offset": None, "y-offset": None}
-        return {"x-offset": int(offset_xy[0]), "y-offset": int(offset_xy[1])}
+            return {
+                "x-offset": None,
+                "x-offset-rate": None,
+                "y-offset": None,
+                "y-offset-rate": None,
+            }
+
+        x_rate = None if offset_rate_xy is None else float(f"{offset_rate_xy[0]:.2f}")
+        y_rate = None if offset_rate_xy is None else float(f"{offset_rate_xy[1]:.2f}")
+        return {
+            "x-offset": int(offset_xy[0]),
+            "x-offset-rate": x_rate,
+            "y-offset": int(offset_xy[1]),
+            "y-offset-rate": y_rate,
+        }
 
 
 def create_offset_api(offset_state: OffsetState) -> FastAPI:
     app = FastAPI(title="HSV Offset API")
 
     @app.get("/get-offset-xy")
-    def get_offset_xy() -> dict[str, Optional[int]]:
+    def get_offset_xy() -> dict[str, object]:
         return offset_state.payload()
 
     return app
@@ -389,7 +408,7 @@ class VideoWorker(threading.Thread):
 
             try:
                 result = detect_objects(frame, state.config)
-                self._offset_state.set(result.closest_offset_xy)
+                self._offset_state.set(result.closest_offset_xy, result.closest_offset_rate_xy)
                 display = render_frame(frame, result, state)
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
                 raw_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -409,6 +428,7 @@ class VideoWorker(threading.Thread):
                     "center_rects": result.center_rect_details,
                     "closest_rect": result.closest_rect_details,
                     "closest_offset_xy": result.closest_offset_xy,
+                    "closest_offset_rate_xy": result.closest_offset_rate_xy,
                     "has_hsv_target": bool(result.all_rects),
                     "has_final_target": result.closest_rect is not None,
                     "hsv_low": state.config.lower_hsv,
@@ -428,6 +448,8 @@ class VideoWorker(threading.Thread):
                     result.closest_rect_details,
                     "closest_offset_xy=",
                     result.closest_offset_xy,
+                    "closest_offset_rate_xy=",
+                    result.closest_offset_rate_xy,
                     "has_hsv_target=",
                     bool(result.all_rects),
                     flush=True,
@@ -503,6 +525,16 @@ def render_frame(frame, result, state: AppState):
             display,
             f"center={result.closest_offset_xy}",
             (box.x, min(frame.shape[0] - 8, box.y2 + 38)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            display,
+            f"rate={result.closest_offset_rate_xy}",
+            (box.x, min(frame.shape[0] - 8, box.y2 + 58)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             (255, 0, 0),
@@ -593,6 +625,7 @@ class App(tk.Tk):
         self.preview_rgb: Optional[tuple[int, int, int]] = None
         self.preview_xy: Optional[tuple[int, int]] = None
         self.offset_text = "(X,Y)"
+        self.offset_rate_text = "(X-rate,Y-rate)"
 
         self.source_mode = tk.StringVar(value=initial_state.source_mode)
         self.camera_var = tk.IntVar(value=initial_state.camera_index)
@@ -733,6 +766,9 @@ class App(tk.Tk):
         self.offset_canvas = tk.Canvas(frame, height=58, bg="#ffffff", highlightthickness=0, bd=0)
         self.offset_canvas.pack(fill=tk.X)
         self.offset_canvas.bind("<Configure>", lambda _event: self._draw_offset_badge())
+        self.offset_rate_canvas = tk.Canvas(frame, height=50, bg="#ffffff", highlightthickness=0, bd=0)
+        self.offset_rate_canvas.pack(fill=tk.X, pady=(6, 0))
+        self.offset_rate_canvas.bind("<Configure>", lambda _event: self._draw_offset_badge())
         self.api_text = tk.StringVar(value=f"接口：{self.api_url}")
         tk.Label(
             frame,
@@ -753,41 +789,50 @@ class App(tk.Tk):
         x2: int,
         y2: int,
         radius: int,
-        **kwargs,
+        outline: str,
+        width: int,
     ) -> None:
         radius = max(1, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
-        canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, style=tk.ARC, **kwargs)
-        canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, style=tk.ARC, **kwargs)
-        canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, style=tk.ARC, **kwargs)
-        canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, style=tk.ARC, **kwargs)
-        canvas.create_line(x1 + radius, y1, x2 - radius, y1, **kwargs)
-        canvas.create_line(x2, y1 + radius, x2, y2 - radius, **kwargs)
-        canvas.create_line(x1 + radius, y2, x2 - radius, y2, **kwargs)
-        canvas.create_line(x1, y1 + radius, x1, y2 - radius, **kwargs)
+        arc_options = {"outline": outline, "width": width, "style": tk.ARC}
+        line_options = {"fill": outline, "width": width}
+        canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, **arc_options)
+        canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, **arc_options)
+        canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, **arc_options)
+        canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, **arc_options)
+        canvas.create_line(x1 + radius, y1, x2 - radius, y1, **line_options)
+        canvas.create_line(x2, y1 + radius, x2, y2 - radius, **line_options)
+        canvas.create_line(x1 + radius, y2, x2 - radius, y2, **line_options)
+        canvas.create_line(x1, y1 + radius, x1, y2 - radius, **line_options)
 
     def _draw_offset_badge(self) -> None:
-        if not hasattr(self, "offset_canvas"):
+        if not hasattr(self, "offset_canvas") or not hasattr(self, "offset_rate_canvas"):
             return
-        canvas = self.offset_canvas
+
+        self._draw_badge_canvas(self.offset_canvas, self.offset_text, 22)
+        self._draw_badge_canvas(self.offset_rate_canvas, self.offset_rate_text, 18)
+
+    def _draw_badge_canvas(self, canvas: tk.Canvas, text: str, font_size: int) -> None:
         canvas.delete("all")
         width = max(1, canvas.winfo_width())
         height = max(1, canvas.winfo_height())
+        if width < 24 or height < 24:
+            return
         self._draw_rounded_rect(
             canvas,
-            2,
-            2,
-            width - 3,
-            height - 3,
+            4,
+            4,
+            width - 5,
+            height - 5,
             14,
-            fill="#2563eb",
+            outline="#2563eb",
             width=3,
         )
         canvas.create_text(
             width // 2,
             height // 2,
-            text=self.offset_text,
+            text=text,
             fill="#2563eb",
-            font=("Arial", 22, "bold"),
+            font=("Arial", font_size, "bold"),
         )
 
     def refresh_cameras(self, show_status: bool = True) -> None:
@@ -1060,8 +1105,8 @@ class App(tk.Tk):
     def stop_camera(self) -> None:
         self.source_mode.set("idle")
         self.worker.update_state(source_mode="idle", image_path=None)
-        self.offset_state.set(None)
-        self._set_offset_text(None)
+        self.offset_state.set(None, None)
+        self._set_offset_text(None, None)
         self.last_rgb = None
         self.last_raw_rgb = None
         self.last_image_size = (0, 0)
@@ -1244,10 +1289,13 @@ class App(tk.Tk):
 
             if frame_item["has_final_target"]:
                 self.result_vars["closest"].set(f"最终最近框：{frame_item['closest_rect']}")
-                self._set_offset_text(frame_item["closest_offset_xy"])
+                self._set_offset_text(
+                    frame_item["closest_offset_xy"],
+                    frame_item["closest_offset_rate_xy"],
+                )
             else:
                 self.result_vars["closest"].set("最终最近框：无")
-                self._set_offset_text(None)
+                self._set_offset_text(None, None)
 
         event_item = self.event_queue.get_nowait()
         if event_item is not None:
@@ -1282,11 +1330,21 @@ class App(tk.Tk):
         except Exception as exc:
             self._show_error(f"GUI显示帧失败：{exc}", traceback.format_exc())
 
-    def _set_offset_text(self, offset_xy: Optional[tuple[int, int]]) -> None:
+    def _set_offset_text(
+        self,
+        offset_xy: Optional[tuple[int, int]],
+        offset_rate_xy: Optional[tuple[float, float]],
+    ) -> None:
         if offset_xy is None:
             self.offset_text = "(X,Y)"
         else:
             self.offset_text = f"({offset_xy[0]}, {offset_xy[1]})"
+
+        if offset_rate_xy is None:
+            self.offset_rate_text = "(X-rate,Y-rate)"
+        else:
+            self.offset_rate_text = f"({offset_rate_xy[0]:.2f}, {offset_rate_xy[1]:.2f})"
+
         self._draw_offset_badge()
 
     def _fit_video_size(self, image_w: int, image_h: int) -> tuple[int, int]:

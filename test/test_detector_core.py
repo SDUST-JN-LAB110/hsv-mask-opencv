@@ -8,7 +8,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hsv_detector import BoundingBox, DetectionConfig, center_coordinate_offset, detect_objects, require_opencv
+from hsv_detector import (
+    BoundingBox,
+    DetectionConfig,
+    center_coordinate_offset,
+    center_coordinate_offset_rate,
+    detect_objects,
+    require_opencv,
+)
 
 
 def create_self_test_frame():
@@ -30,12 +37,15 @@ def main() -> int:
     assert result.all_rects, "default red-orange HSV should detect the self-test target"
     assert result.closest_rect is not None
     assert center_coordinate_offset(BoundingBox(360, 170, 20, 40), frame.shape) == (50, 50)
+    assert center_coordinate_offset_rate((50, -50), frame.shape) == (0.16, -0.21)
     assert result.closest_offset_xy is not None
+    assert result.closest_offset_rate_xy is not None
 
     print("detector core smoke test passed")
     print("all_rects=", result.all_rect_details)
     print("closest_rect=", result.closest_rect_details)
     print("closest_offset_xy=", result.closest_offset_xy)
+    print("closest_offset_rate_xy=", result.closest_offset_rate_xy)
     return 0
 
 

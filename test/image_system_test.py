@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Optional, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hsv_detector import (
     DEFAULT_LOWER_HSV,
@@ -56,6 +59,7 @@ def result_payload(image_path: Path, frame_shape, result) -> dict:
         "center_rects": result.center_rect_details,
         "closest_rect": result.closest_rect_details,
         "closest_offset_xy": result.closest_offset_xy,
+        "closest_offset_rate_xy": result.closest_offset_rate_xy,
         "has_hsv_target": result.has_hsv_target,
         "has_final_target": result.has_final_target,
     }

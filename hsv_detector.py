@@ -147,6 +147,7 @@ class DetectionResult:
     center_rects: list[BoundingBox]
     closest_rect: Optional[BoundingBox]
     closest_offset_xy: Optional[tuple[int, int]]
+    closest_offset_rate_xy: Optional[tuple[float, float]]
 
     @property
     def all_rect_coords(self) -> list[tuple[int, int, int, int]]:
@@ -391,6 +392,27 @@ def center_coordinate_offset(
     )
 
 
+def center_coordinate_offset_rate(
+    offset_xy: Optional[tuple[int, int]], frame_shape: Sequence[int]
+) -> Optional[tuple[float, float]]:
+    if offset_xy is None:
+        return None
+
+    frame_h, frame_w = frame_shape[:2]
+    x_axis_boundary = frame_w / 2.0
+    y_axis_boundary = frame_h / 2.0
+    if x_axis_boundary <= 0 or y_axis_boundary <= 0:
+        return None
+
+    x_offset, y_offset = offset_xy
+    x_rate = round(x_offset / x_axis_boundary, 2)
+    y_rate = round(y_offset / y_axis_boundary, 2)
+    return (
+        0.0 if x_rate == 0 else x_rate,
+        0.0 if y_rate == 0 else y_rate,
+    )
+
+
 def detect_objects(frame: Any, config: DetectionConfig) -> DetectionResult:
     """Return all boxes, size-filtered boxes, and the center-nearest box."""
     require_opencv()
@@ -420,6 +442,7 @@ def detect_objects(frame: Any, config: DetectionConfig) -> DetectionResult:
     center_rects = filter_boxes_by_center_region(filtered_rects, frame.shape, config)
     closest_rect = choose_closest_to_center(center_rects, frame.shape)
     closest_offset_xy = center_coordinate_offset(closest_rect, frame.shape)
+    closest_offset_rate_xy = center_coordinate_offset_rate(closest_offset_xy, frame.shape)
     return DetectionResult(
         mask,
         all_rects,
@@ -427,6 +450,7 @@ def detect_objects(frame: Any, config: DetectionConfig) -> DetectionResult:
         center_rects,
         closest_rect,
         closest_offset_xy,
+        closest_offset_rate_xy,
     )
 
 
@@ -952,6 +976,16 @@ def draw_detections(
             2,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            display,
+            f"rate={result.closest_offset_rate_xy}",
+            (box.x, min(frame.shape[0] - 8, box.y2 + 58)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
 
     display = resize_for_display(display, display_scale)
     view_label = "HSV掩膜" if display_mask else "原画面"
@@ -969,6 +1003,7 @@ def draw_detections(
             f"中心候选框={result.center_rect_details}",
             f"最终最近框={result.closest_rect_details if result.has_final_target else '无'}",
             f"中央坐标系偏移={result.closest_offset_xy if result.closest_offset_xy is not None else '(X,Y)'}",
+            f"中央坐标系偏移率={result.closest_offset_rate_xy if result.closest_offset_rate_xy is not None else '(X,Y)'}",
             picker_text,
             "按键：q退出 | m切换画面/掩膜 | b切换框 | +/-缩放显示 | c/p切换摄像头 | 0-9选摄像头",
         ],
@@ -989,6 +1024,8 @@ def print_detection_result(result: DetectionResult) -> None:
         result.closest_rect_details,
         "closest_offset_xy=",
         result.closest_offset_xy,
+        "closest_offset_rate_xy=",
+        result.closest_offset_rate_xy,
         "has_hsv_target=",
         result.has_hsv_target,
         "has_final_target=",
