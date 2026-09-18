@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hsv_detector import (
     BoundingBox,
     DetectionConfig,
+    ObjectStabilityTracker,
     center_coordinate_offset,
     center_coordinate_offset_rate,
     detect_objects,
@@ -40,6 +41,45 @@ def main() -> int:
     assert center_coordinate_offset_rate((50, -50), frame.shape) == (0.16, -0.21)
     assert result.closest_offset_xy is not None
     assert result.closest_offset_rate_xy is not None
+
+    tracker = ObjectStabilityTracker(
+        window_size=5,
+        stable_confirm_frames=2,
+        unstable_confirm_frames=2,
+        max_accel_ratio=0.1,
+    )
+    frame_shape = (100, 100, 3)
+    smooth_boxes = [
+        BoundingBox(10, 10, 20, 20),
+        BoundingBox(12, 10, 20, 20),
+        BoundingBox(14, 10, 20, 20),
+        BoundingBox(16, 10, 20, 20),
+        BoundingBox(18, 10, 20, 20),
+        BoundingBox(20, 10, 20, 20),
+    ]
+    stable_values = [tracker.update(box, frame_shape) for box in smooth_boxes]
+    assert stable_values[-1] is True
+    assert tracker.payload() == {"if-obj-stable": 1}
+    assert tracker.update(None, frame_shape) is True
+    assert tracker.update(None, frame_shape) is False
+    assert tracker.payload() == {"if-obj-stable": 0}
+
+    jump_tracker = ObjectStabilityTracker(
+        window_size=5,
+        stable_confirm_frames=1,
+        unstable_confirm_frames=1,
+        max_accel_ratio=0.1,
+    )
+    jump_boxes = [
+        BoundingBox(10, 10, 20, 20),
+        BoundingBox(12, 10, 20, 20),
+        BoundingBox(14, 10, 20, 20),
+        BoundingBox(16, 10, 20, 20),
+        BoundingBox(80, 10, 20, 20),
+    ]
+    for box in jump_boxes:
+        jump_is_stable = jump_tracker.update(box, frame_shape)
+    assert jump_is_stable is False
 
     print("detector core smoke test passed")
     print("all_rects=", result.all_rect_details)

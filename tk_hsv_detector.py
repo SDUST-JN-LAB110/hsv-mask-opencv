@@ -12,6 +12,7 @@ This is the recommended GUI for algorithm testing:
 from __future__ import annotations
 
 import argparse
+import json
 import platform
 import queue
 import re
@@ -60,6 +61,7 @@ from hsv_detector import (
     DEFAULT_LOWER_HSV,
     DEFAULT_UPPER_HSV,
     DetectionConfig,
+    ObjectStabilityTracker,
     center_region_bounds,
     clamp_center_region_ratio,
     clamp_int,
@@ -72,6 +74,8 @@ from hsv_detector import (
 
 APP_TITLE = "HSV 轻量测试工具"
 MAX_CAMERA_SCAN_INDEX = 9
+CONFIG_SCHEMA_VERSION = 1
+DEFAULT_CONFIG_NAME = "default.json"
 
 
 def pil_bilinear_resample():
@@ -173,6 +177,170 @@ def create_self_test_frame(width: int = 640, height: int = 480):
     return frame
 
 
+def default_config_paths() -> list[Path]:
+    paths = [Path.cwd() / DEFAULT_CONFIG_NAME, Path(__file__).resolve().parent / DEFAULT_CONFIG_NAME]
+    unique_paths: list[Path] = []
+    for path in paths:
+        if path not in unique_paths:
+            unique_paths.append(path)
+    return unique_paths
+
+
+def find_default_config_path() -> Optional[Path]:
+    for path in default_config_paths():
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def hsv_tuple(raw, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        return fallback
+    try:
+        h, s, v = (int(raw[0]), int(raw[1]), int(raw[2]))
+    except (TypeError, ValueError):
+        return fallback
+    return (
+        clamp_int(h, 0, 179),
+        clamp_int(s, 0, 255),
+        clamp_int(v, 0, 255),
+    )
+
+
+def int_config_value(payload: dict, key: str, fallback: int, lower: int, upper: int) -> int:
+    try:
+        value = int(payload.get(key, fallback))
+    except (TypeError, ValueError):
+        value = fallback
+    return clamp_int(value, lower, upper)
+
+
+def float_config_value(payload: dict, key: str, fallback: float, lower: float, upper: float) -> float:
+    try:
+        value = float(payload.get(key, fallback))
+    except (TypeError, ValueError):
+        value = fallback
+    return min(max(value, lower), upper)
+
+
+def bool_config_value(payload: dict, key: str, fallback: bool) -> bool:
+    value = payload.get(key, fallback)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def detection_config_to_payload(config: DetectionConfig) -> dict:
+    return {
+        "lower_hsv": list(config.lower_hsv),
+        "upper_hsv": list(config.upper_hsv),
+        "min_area_px": int(config.min_area_px),
+        "max_area_px": int(config.max_area_px),
+        "frame_blur_kernel": int(config.frame_blur_kernel),
+        "mask_median_kernel": int(config.mask_median_kernel),
+        "morph_kernel": int(config.morph_kernel),
+        "open_iterations": int(config.open_iterations),
+        "close_iterations": int(config.close_iterations),
+        "process_scale": float(config.process_scale),
+        "center_region_ratio": float(config.center_region_ratio),
+    }
+
+
+def detection_config_from_payload(payload: dict, fallback: DetectionConfig) -> DetectionConfig:
+    if not isinstance(payload, dict):
+        payload = {}
+    min_area_px = int_config_value(payload, "min_area_px", fallback.min_area_px, 0, 10_000_000)
+    max_area_px = int_config_value(payload, "max_area_px", fallback.max_area_px, 0, 10_000_000)
+    if max_area_px <= 0:
+        max_area_px = 10_000_000
+    if min_area_px > max_area_px:
+        min_area_px = max_area_px
+
+    return DetectionConfig(
+        lower_hsv=hsv_tuple(payload.get("lower_hsv"), fallback.lower_hsv),
+        upper_hsv=hsv_tuple(payload.get("upper_hsv"), fallback.upper_hsv),
+        min_area_px=min_area_px,
+        max_area_px=max_area_px,
+        frame_blur_kernel=int_config_value(payload, "frame_blur_kernel", fallback.frame_blur_kernel, 0, 31),
+        mask_median_kernel=int_config_value(payload, "mask_median_kernel", fallback.mask_median_kernel, 0, 31),
+        morph_kernel=int_config_value(payload, "morph_kernel", fallback.morph_kernel, 0, 31),
+        open_iterations=int_config_value(payload, "open_iterations", fallback.open_iterations, 0, 5),
+        close_iterations=int_config_value(payload, "close_iterations", fallback.close_iterations, 0, 5),
+        process_scale=clamp_process_scale(
+            float_config_value(payload, "process_scale", fallback.process_scale, 0.1, 1.0)
+        ),
+        center_region_ratio=clamp_center_region_ratio(
+            float_config_value(payload, "center_region_ratio", fallback.center_region_ratio, 0.01, 1.0)
+        ),
+    )
+
+
+def app_state_to_config_payload(state: AppState) -> dict:
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "camera_index": int(state.camera_index),
+        "self_test_width": int(state.width),
+        "self_test_height": int(state.height),
+        "view_mode": state.view_mode,
+        "box_mode": state.box_mode,
+        "show_center_region": bool(state.show_center_region),
+        "show_reticle": bool(state.show_reticle),
+        "display_scale": float(state.display_scale),
+        "pick_radius": int(state.pick_radius),
+        "h_pick_tol": int(state.h_pick_tol),
+        "s_pick_tol": int(state.s_pick_tol),
+        "v_pick_tol": int(state.v_pick_tol),
+        "print_interval": float(state.print_interval),
+        "detection": detection_config_to_payload(state.config),
+    }
+
+
+def app_state_from_config_payload(payload: dict, fallback: AppState) -> AppState:
+    if not isinstance(payload, dict):
+        payload = {}
+    view_mode = payload.get("view_mode", fallback.view_mode)
+    if view_mode not in {"original", "mask"}:
+        view_mode = fallback.view_mode
+    box_mode = payload.get("box_mode", fallback.box_mode)
+    if box_mode not in {"all", "center", "closest"}:
+        box_mode = fallback.box_mode
+
+    return replace(
+        fallback,
+        camera_index=int_config_value(payload, "camera_index", fallback.camera_index, 0, MAX_CAMERA_SCAN_INDEX),
+        width=int_config_value(payload, "self_test_width", fallback.width, 0, 4096),
+        height=int_config_value(payload, "self_test_height", fallback.height, 0, 2160),
+        config=detection_config_from_payload(payload.get("detection", {}), fallback.config),
+        view_mode=view_mode,
+        box_mode=box_mode,
+        show_center_region=bool_config_value(payload, "show_center_region", fallback.show_center_region),
+        show_reticle=bool_config_value(payload, "show_reticle", fallback.show_reticle),
+        display_scale=float_config_value(payload, "display_scale", fallback.display_scale, 0.25, 1.0),
+        pick_radius=int_config_value(payload, "pick_radius", fallback.pick_radius, 0, 50),
+        h_pick_tol=int_config_value(payload, "h_pick_tol", fallback.h_pick_tol, 0, 90),
+        s_pick_tol=int_config_value(payload, "s_pick_tol", fallback.s_pick_tol, 0, 255),
+        v_pick_tol=int_config_value(payload, "v_pick_tol", fallback.v_pick_tol, 0, 255),
+        print_interval=float_config_value(payload, "print_interval", fallback.print_interval, 0.0, 60.0),
+    )
+
+
+def load_config_payload(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise ValueError("配置文件顶层必须是 JSON 对象")
+    return payload
+
+
+def save_config_payload(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+
+
 class LatestQueue:
     def __init__(self) -> None:
         self.queue: queue.Queue[dict] = queue.Queue(maxsize=1)
@@ -198,23 +366,27 @@ class OffsetState:
     def __init__(self) -> None:
         self._offset_xy: Optional[tuple[int, int]] = None
         self._offset_rate_xy: Optional[tuple[float, float]] = None
+        self._obj_stable = False
         self._lock = threading.Lock()
 
     def set(
         self,
         offset_xy: Optional[tuple[int, int]],
         offset_rate_xy: Optional[tuple[float, float]],
+        obj_stable: Optional[bool] = None,
     ) -> None:
         with self._lock:
             self._offset_xy = offset_xy
             self._offset_rate_xy = offset_rate_xy
+            if obj_stable is not None:
+                self._obj_stable = bool(obj_stable)
 
-    def get(self) -> tuple[Optional[tuple[int, int]], Optional[tuple[float, float]]]:
+    def get(self) -> tuple[Optional[tuple[int, int]], Optional[tuple[float, float]], bool]:
         with self._lock:
-            return self._offset_xy, self._offset_rate_xy
+            return self._offset_xy, self._offset_rate_xy, self._obj_stable
 
     def payload(self) -> dict[str, object]:
-        offset_xy, offset_rate_xy = self.get()
+        offset_xy, offset_rate_xy, _obj_stable = self.get()
         if offset_xy is None:
             return {
                 "x-offset": None,
@@ -232,6 +404,10 @@ class OffsetState:
             "y-offset-rate": y_rate,
         }
 
+    def stable_payload(self) -> dict[str, int]:
+        with self._lock:
+            return {"if-obj-stable": 1 if self._obj_stable else 0}
+
 
 def create_offset_api(offset_state: OffsetState) -> FastAPI:
     app = FastAPI(title="HSV Offset API")
@@ -239,6 +415,10 @@ def create_offset_api(offset_state: OffsetState) -> FastAPI:
     @app.get("/get-offset-xy")
     def get_offset_xy() -> dict[str, object]:
         return offset_state.payload()
+
+    @app.get("/if-obj-stable")
+    def if_obj_stable() -> dict[str, int]:
+        return offset_state.stable_payload()
 
     return app
 
@@ -257,6 +437,7 @@ class VideoWorker(threading.Thread):
         self._frame_queue = frame_queue
         self._event_queue = event_queue
         self._offset_state = offset_state
+        self._stability_tracker = ObjectStabilityTracker()
         self._latest_raw_frame = None
         self._latest_raw_frame_lock = threading.Lock()
         self._running = threading.Event()
@@ -351,6 +532,8 @@ class VideoWorker(threading.Thread):
                     cap = None
                 image_frame = None
                 opened_signature = signature
+                self._stability_tracker.reset()
+                self._offset_state.set(None, None, False)
 
                 if state.source_mode == "camera":
                     cap = cv2.VideoCapture(state.camera_index)
@@ -408,11 +591,18 @@ class VideoWorker(threading.Thread):
 
             try:
                 result = detect_objects(frame, state.config)
-                self._offset_state.set(result.closest_offset_xy, result.closest_offset_rate_xy)
+                obj_stable = self._stability_tracker.update(result.closest_rect, frame.shape)
+                self._offset_state.set(
+                    result.closest_offset_xy,
+                    result.closest_offset_rate_xy,
+                    obj_stable,
+                )
                 display = render_frame(frame, result, state)
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
                 raw_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             except Exception as exc:  # pragma: no cover - defensive GUI boundary
+                self._stability_tracker.reset()
+                self._offset_state.set(None, None, False)
                 self._event_queue.put({"type": "error", "message": f"识别处理失败：{exc}"})
                 time.sleep(0.1)
                 continue
@@ -429,6 +619,7 @@ class VideoWorker(threading.Thread):
                     "closest_rect": result.closest_rect_details,
                     "closest_offset_xy": result.closest_offset_xy,
                     "closest_offset_rate_xy": result.closest_offset_rate_xy,
+                    "obj_stable": obj_stable,
                     "has_hsv_target": bool(result.all_rects),
                     "has_final_target": result.closest_rect is not None,
                     "hsv_low": state.config.lower_hsv,
@@ -450,6 +641,8 @@ class VideoWorker(threading.Thread):
                     result.closest_offset_xy,
                     "closest_offset_rate_xy=",
                     result.closest_offset_rate_xy,
+                    "if_obj_stable=",
+                    1 if obj_stable else 0,
                     "has_hsv_target=",
                     bool(result.all_rects),
                     flush=True,
@@ -603,6 +796,20 @@ class App(tk.Tk):
         self.geometry("1240x760")
         self.minsize(980, 620)
 
+        self.factory_state = initial_state
+        self.auto_loaded_config_path: Optional[Path] = None
+        self.config_load_error = ""
+        default_config_path = find_default_config_path()
+        if default_config_path is not None:
+            try:
+                initial_state = app_state_from_config_payload(
+                    load_config_payload(default_config_path),
+                    initial_state,
+                )
+                self.auto_loaded_config_path = default_config_path
+            except Exception as exc:
+                self.config_load_error = f"默认配置加载失败：{exc}"
+
         self.frame_queue = LatestQueue()
         self.event_queue = LatestQueue()
         self.offset_state = OffsetState()
@@ -626,6 +833,7 @@ class App(tk.Tk):
         self.preview_xy: Optional[tuple[int, int]] = None
         self.offset_text = "(X,Y)"
         self.offset_rate_text = "(X-rate,Y-rate)"
+        self.stability_text = "不稳定"
 
         self.source_mode = tk.StringVar(value=initial_state.source_mode)
         self.camera_var = tk.IntVar(value=initial_state.camera_index)
@@ -645,6 +853,10 @@ class App(tk.Tk):
             self.source_mode.set("idle")
             self.worker.update_state(source_mode="idle")
         self._push_state()
+        if self.auto_loaded_config_path is not None:
+            self.status_var.set(f"已自动加载默认配置：{self.auto_loaded_config_path}")
+        elif self.config_load_error:
+            self.status_var.set(self.config_load_error)
         self.worker.start()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(15, self._poll_queues)
@@ -676,6 +888,7 @@ class App(tk.Tk):
         self._show_video_message("等待视频画面")
 
         self._offset_display(panel)
+        self._config_controls(panel)
         self._source_controls(panel)
         self._display_controls(panel)
         self._hsv_controls(panel, state.config)
@@ -691,7 +904,8 @@ class App(tk.Tk):
 
     def _api_url(self, host: str, port: int) -> str:
         display_host = "127.0.0.1" if host == "0.0.0.0" else host
-        return f"http://{display_host}:{port}/get-offset-xy"
+        base_url = f"http://{display_host}:{port}"
+        return f"{base_url}/get-offset-xy | {base_url}/if-obj-stable"
 
     def _start_api_server(self, host: str, port: int):
         if FastAPI is None or uvicorn is None:
@@ -760,6 +974,14 @@ class App(tk.Tk):
         ttk.Label(frame, text=title, style="Title.TLabel").pack(anchor=tk.W, pady=(0, 6))
         return frame
 
+    def _config_controls(self, parent) -> None:
+        frame = self._group(parent, "配置")
+        row = ttk.Frame(frame, style="Panel.TFrame")
+        row.pack(fill=tk.X, pady=2)
+        ttk.Button(row, text="保存当前配置", command=self.save_current_config).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="加载配置", command=self.load_config).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="恢复默认", command=self.restore_factory_config).pack(side=tk.LEFT)
+
     def _offset_display(self, parent) -> None:
         frame = ttk.Frame(parent, style="Panel.TFrame", padding=(0, 0, 0, 12))
         frame.pack(fill=tk.X, pady=(0, 10))
@@ -769,6 +991,9 @@ class App(tk.Tk):
         self.offset_rate_canvas = tk.Canvas(frame, height=50, bg="#ffffff", highlightthickness=0, bd=0)
         self.offset_rate_canvas.pack(fill=tk.X, pady=(6, 0))
         self.offset_rate_canvas.bind("<Configure>", lambda _event: self._draw_offset_badge())
+        self.stability_canvas = tk.Canvas(frame, height=50, bg="#ffffff", highlightthickness=0, bd=0)
+        self.stability_canvas.pack(fill=tk.X, pady=(6, 0))
+        self.stability_canvas.bind("<Configure>", lambda _event: self._draw_offset_badge())
         self.api_text = tk.StringVar(value=f"接口：{self.api_url}")
         tk.Label(
             frame,
@@ -805,13 +1030,25 @@ class App(tk.Tk):
         canvas.create_line(x1, y1 + radius, x1, y2 - radius, **line_options)
 
     def _draw_offset_badge(self) -> None:
-        if not hasattr(self, "offset_canvas") or not hasattr(self, "offset_rate_canvas"):
+        if (
+            not hasattr(self, "offset_canvas")
+            or not hasattr(self, "offset_rate_canvas")
+            or not hasattr(self, "stability_canvas")
+        ):
             return
 
         self._draw_badge_canvas(self.offset_canvas, self.offset_text, 22)
         self._draw_badge_canvas(self.offset_rate_canvas, self.offset_rate_text, 18)
+        stable_color = "#16a34a" if self.stability_text == "稳定" else "#dc2626"
+        self._draw_badge_canvas(self.stability_canvas, self.stability_text, 20, stable_color)
 
-    def _draw_badge_canvas(self, canvas: tk.Canvas, text: str, font_size: int) -> None:
+    def _draw_badge_canvas(
+        self,
+        canvas: tk.Canvas,
+        text: str,
+        font_size: int,
+        color: str = "#2563eb",
+    ) -> None:
         canvas.delete("all")
         width = max(1, canvas.winfo_width())
         height = max(1, canvas.winfo_height())
@@ -824,16 +1061,151 @@ class App(tk.Tk):
             width - 5,
             height - 5,
             14,
-            outline="#2563eb",
+            outline=color,
             width=3,
         )
         canvas.create_text(
             width // 2,
             height // 2,
             text=text,
-            fill="#2563eb",
+            fill=color,
             font=("Arial", font_size, "bold"),
         )
+
+    def _current_config_state(self) -> AppState:
+        box_map = {
+            "全部矩形框": "all",
+            "中心候选框": "center",
+            "只显示最终最近框": "closest",
+        }
+        return replace(
+            self.worker.snapshot(),
+            camera_index=int(self.camera_var.get()),
+            width=int(self.width_var.get()),
+            height=int(self.height_var.get()),
+            config=self.current_config(),
+            view_mode=self.view_mode.get(),
+            box_mode=box_map.get(self.box_combo.get(), "all"),
+            show_center_region=bool(self.show_center_var.get()),
+            show_reticle=bool(self.show_reticle_var.get()),
+            display_scale=self.sliders["display_scale"].value() / 100.0,
+            pick_radius=self.sliders["pick_radius"].value(),
+            h_pick_tol=self.sliders["h_pick_tol"].value(),
+            s_pick_tol=self.sliders["s_pick_tol"].value(),
+            v_pick_tol=self.sliders["v_pick_tol"].value(),
+        )
+
+    def _select_camera_index(self, camera_index: int) -> None:
+        self.camera_var.set(camera_index)
+        for pos, device in enumerate(self.camera_devices):
+            if device.index == camera_index:
+                self.camera_combo.current(pos)
+                self.camera_device_var.set(device.label)
+                return
+        if self.camera_devices:
+            self.camera_device_var.set(f"摄像头 {camera_index}")
+
+    def _apply_config_state(self, state: AppState) -> None:
+        self._select_camera_index(state.camera_index)
+        self.width_var.set(state.width)
+        self.height_var.set(state.height)
+        self.view_mode.set(state.view_mode)
+        self.box_combo.set(
+            {
+                "all": "全部矩形框",
+                "center": "中心候选框",
+                "closest": "只显示最终最近框",
+            }.get(state.box_mode, "全部矩形框")
+        )
+        self.show_center_var.set(state.show_center_region)
+        self.show_reticle_var.set(state.show_reticle)
+
+        slider_values = {
+            "display_scale": int(round(state.display_scale * 100)),
+            "h_low": state.config.lower_hsv[0],
+            "s_low": state.config.lower_hsv[1],
+            "v_low": state.config.lower_hsv[2],
+            "h_high": state.config.upper_hsv[0],
+            "s_high": state.config.upper_hsv[1],
+            "v_high": state.config.upper_hsv[2],
+            "min_area_px": int(state.config.min_area_px),
+            "max_area_px": int(state.config.max_area_px),
+            "center_ratio": int(round(state.config.center_region_ratio * 100)),
+            "process_scale": int(round(state.config.process_scale * 100)),
+            "frame_blur": int(state.config.frame_blur_kernel),
+            "mask_median": int(state.config.mask_median_kernel),
+            "morph": int(state.config.morph_kernel),
+            "open_iter": int(state.config.open_iterations),
+            "close_iter": int(state.config.close_iterations),
+            "pick_radius": int(state.pick_radius),
+            "h_pick_tol": int(state.h_pick_tol),
+            "s_pick_tol": int(state.s_pick_tol),
+            "v_pick_tol": int(state.v_pick_tol),
+        }
+        for key, value in slider_values.items():
+            if key in self.sliders:
+                self.sliders[key].set_value(value)
+
+        self.worker.update_state(print_interval=state.print_interval)
+        self._push_state()
+        self._render_last_frame()
+
+    def save_current_config(self) -> None:
+        answer = messagebox.askyesnocancel(
+            "保存配置",
+            "是否保存为默认配置？\n\n选择“是”保存为 default.json。\n选择“否”另存为配置文件。",
+        )
+        if answer is None:
+            return
+
+        if answer:
+            path = default_config_paths()[0]
+        else:
+            file_name = filedialog.asksaveasfilename(
+                title="另存为配置",
+                defaultextension=".json",
+                filetypes=[("JSON 配置", "*.json"), ("所有文件", "*.*")],
+            )
+            if not file_name:
+                return
+            path = Path(file_name)
+
+        try:
+            save_config_payload(path, app_state_to_config_payload(self._current_config_state()))
+        except Exception as exc:
+            messagebox.showerror("保存配置失败", str(exc))
+            self.status_var.set(f"保存配置失败：{exc}")
+            return
+
+        self.status_var.set(f"配置已保存：{path}")
+
+    def load_config(self) -> None:
+        file_name = filedialog.askopenfilename(
+            title="加载配置",
+            filetypes=[("JSON 配置", "*.json"), ("所有文件", "*.*")],
+        )
+        if not file_name:
+            return
+
+        path = Path(file_name)
+        try:
+            state = app_state_from_config_payload(
+                load_config_payload(path),
+                self._current_config_state(),
+            )
+            self._apply_config_state(state)
+        except Exception as exc:
+            messagebox.showerror("加载配置失败", str(exc))
+            self.status_var.set(f"加载配置失败：{exc}")
+            return
+
+        self.status_var.set(f"配置已加载：{path}")
+
+    def restore_factory_config(self) -> None:
+        if not messagebox.askyesno("恢复默认", "确认恢复程序默认配置吗？"):
+            return
+        self._apply_config_state(self.factory_state)
+        self.status_var.set("已恢复程序默认配置")
 
     def refresh_cameras(self, show_status: bool = True) -> None:
         if show_status:
@@ -1002,6 +1374,7 @@ class App(tk.Tk):
             "filtered": tk.StringVar(value="像素面积过滤后：-"),
             "center": tk.StringVar(value="中心候选框：-"),
             "closest": tk.StringVar(value="最终最近框：-"),
+            "stable": tk.StringVar(value="稳定识别：-"),
         }
         for var in self.result_vars.values():
             ttk.Label(frame, textvariable=var, wraplength=330).pack(anchor=tk.W, fill=tk.X)
@@ -1105,8 +1478,9 @@ class App(tk.Tk):
     def stop_camera(self) -> None:
         self.source_mode.set("idle")
         self.worker.update_state(source_mode="idle", image_path=None)
-        self.offset_state.set(None, None)
+        self.offset_state.set(None, None, False)
         self._set_offset_text(None, None)
+        self._set_stability_text(False)
         self.last_rgb = None
         self.last_raw_rgb = None
         self.last_image_size = (0, 0)
@@ -1121,6 +1495,7 @@ class App(tk.Tk):
         self.result_vars["filtered"].set("像素面积过滤后：-")
         self.result_vars["center"].set("中心候选框：-")
         self.result_vars["closest"].set("最终最近框：-")
+        self.result_vars["stable"].set("稳定识别：-")
 
     def open_image(self) -> None:
         file_name = filedialog.askopenfilename(
@@ -1296,6 +1671,11 @@ class App(tk.Tk):
             else:
                 self.result_vars["closest"].set("最终最近框：无")
                 self._set_offset_text(None, None)
+            self.result_vars["stable"].set(
+                f"稳定识别：{'是' if frame_item['obj_stable'] else '否'}"
+                f"（/if-obj-stable={1 if frame_item['obj_stable'] else 0}）"
+            )
+            self._set_stability_text(frame_item["obj_stable"])
 
         event_item = self.event_queue.get_nowait()
         if event_item is not None:
@@ -1345,6 +1725,10 @@ class App(tk.Tk):
         else:
             self.offset_rate_text = f"({offset_rate_xy[0]:.2f}, {offset_rate_xy[1]:.2f})"
 
+        self._draw_offset_badge()
+
+    def _set_stability_text(self, obj_stable: bool) -> None:
+        self.stability_text = "稳定" if obj_stable else "不稳定"
         self._draw_offset_badge()
 
     def _fit_video_size(self, image_w: int, image_h: int) -> tuple[int, int]:
@@ -1431,8 +1815,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hsv-low", type=parse_hsv_triplet, default=DEFAULT_LOWER_HSV)
     parser.add_argument("--hsv-high", type=parse_hsv_triplet, default=DEFAULT_UPPER_HSV)
     parser.add_argument("--print-interval", type=float, default=0.5)
-    parser.add_argument("--api-host", default="127.0.0.1", help="FastAPI host for /get-offset-xy.")
-    parser.add_argument("--api-port", type=int, default=8000, help="FastAPI port for /get-offset-xy.")
+    parser.add_argument("--api-host", default="0.0.0.0", help="FastAPI host for the HTTP interfaces.")
+    parser.add_argument("--api-port", type=int, default=8005, help="FastAPI port for the HTTP interfaces.")
     return parser
 
 

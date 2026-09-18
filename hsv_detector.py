@@ -21,6 +21,7 @@ import math
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
@@ -188,6 +189,162 @@ class DetectionResult:
     @property
     def has_final_target(self) -> bool:
         return self.closest_rect is not None
+
+
+@dataclass(frozen=True)
+class ObjectFrameSample:
+    has_box: bool
+    cx: Optional[float] = None
+    cy: Optional[float] = None
+    w: Optional[float] = None
+    h: Optional[float] = None
+    area: Optional[float] = None
+    ratio: Optional[float] = None
+    conf: float = 0.0
+
+
+class ObjectStabilityTracker:
+    """Track whether the selected object is stable in a recent frame window."""
+
+    def __init__(
+        self,
+        window_size: int = 10,
+        min_presence_ratio: float = 0.8,
+        max_accel_ratio: float = 0.12,
+        min_area_ratio: float = 0.5,
+        max_area_ratio: float = 2.0,
+        min_aspect_ratio: float = 0.6,
+        max_aspect_ratio: float = 1.6,
+        stable_confirm_frames: int = 3,
+        unstable_confirm_frames: int = 3,
+    ) -> None:
+        self.window_size = max(1, int(window_size))
+        self.min_presence_ratio = min(max(float(min_presence_ratio), 0.0), 1.0)
+        self.max_accel_ratio = max(0.0, float(max_accel_ratio))
+        self.min_area_ratio = max(0.0, float(min_area_ratio))
+        self.max_area_ratio = max(self.min_area_ratio, float(max_area_ratio))
+        self.min_aspect_ratio = max(0.0, float(min_aspect_ratio))
+        self.max_aspect_ratio = max(self.min_aspect_ratio, float(max_aspect_ratio))
+        self.stable_confirm_frames = max(1, int(stable_confirm_frames))
+        self.unstable_confirm_frames = max(1, int(unstable_confirm_frames))
+        self._samples: deque[ObjectFrameSample] = deque(maxlen=self.window_size)
+        self._stable_window_streak = 0
+        self._unstable_window_streak = 0
+        self._stable = False
+
+    def reset(self) -> None:
+        self._samples.clear()
+        self._stable_window_streak = 0
+        self._unstable_window_streak = 0
+        self._stable = False
+
+    @property
+    def stable(self) -> bool:
+        return self._stable
+
+    def update(
+        self,
+        box: Optional[BoundingBox],
+        frame_shape: Sequence[int],
+        conf: float = 1.0,
+    ) -> bool:
+        self._samples.append(self._sample_from_box(box, conf))
+        window_is_stable = self._window_is_stable(frame_shape)
+
+        if window_is_stable:
+            self._stable_window_streak += 1
+            self._unstable_window_streak = 0
+            if self._stable_window_streak >= self.stable_confirm_frames:
+                self._stable = True
+        else:
+            self._unstable_window_streak += 1
+            self._stable_window_streak = 0
+            if self._unstable_window_streak >= self.unstable_confirm_frames:
+                self._stable = False
+
+        return self._stable
+
+    def payload(self) -> dict[str, int]:
+        return {"if-obj-stable": 1 if self._stable else 0}
+
+    @staticmethod
+    def _sample_from_box(box: Optional[BoundingBox], conf: float) -> ObjectFrameSample:
+        if box is None:
+            return ObjectFrameSample(has_box=False, conf=0.0)
+        cx, cy = box.center
+        ratio = box.w / float(box.h) if box.h > 0 else 0.0
+        return ObjectFrameSample(
+            has_box=True,
+            cx=cx,
+            cy=cy,
+            w=float(box.w),
+            h=float(box.h),
+            area=float(box.area),
+            ratio=ratio,
+            conf=max(0.0, min(float(conf), 1.0)),
+        )
+
+    def _window_is_stable(self, frame_shape: Sequence[int]) -> bool:
+        if len(self._samples) < self.window_size:
+            return False
+        if not self._samples[-1].has_box:
+            return False
+
+        present_count = sum(1 for sample in self._samples if sample.has_box)
+        min_present = math.ceil(self.window_size * self.min_presence_ratio)
+        if present_count < min_present:
+            return False
+
+        return (
+            self._center_motion_is_smooth(frame_shape)
+            and self._area_change_is_smooth()
+            and self._aspect_change_is_smooth()
+        )
+
+    def _center_motion_is_smooth(self, frame_shape: Sequence[int]) -> bool:
+        frame_h, frame_w = frame_shape[:2]
+        diagonal = math.hypot(frame_w, frame_h)
+        if diagonal <= 0:
+            return False
+        max_accel = diagonal * self.max_accel_ratio
+        previous_velocity: Optional[tuple[float, float]] = None
+
+        for previous, current in zip(self._samples, list(self._samples)[1:]):
+            if not previous.has_box or not current.has_box:
+                previous_velocity = None
+                continue
+            velocity = (current.cx - previous.cx, current.cy - previous.cy)
+            if previous_velocity is not None:
+                accel = math.hypot(
+                    velocity[0] - previous_velocity[0],
+                    velocity[1] - previous_velocity[1],
+                )
+                if accel > max_accel:
+                    return False
+            previous_velocity = velocity
+        return True
+
+    def _area_change_is_smooth(self) -> bool:
+        for previous, current in zip(self._samples, list(self._samples)[1:]):
+            if not previous.has_box or not current.has_box:
+                continue
+            if previous.area is None or previous.area <= 0 or current.area is None:
+                return False
+            ratio = current.area / previous.area
+            if not (self.min_area_ratio <= ratio <= self.max_area_ratio):
+                return False
+        return True
+
+    def _aspect_change_is_smooth(self) -> bool:
+        for previous, current in zip(self._samples, list(self._samples)[1:]):
+            if not previous.has_box or not current.has_box:
+                continue
+            if previous.ratio is None or previous.ratio <= 0 or current.ratio is None:
+                return False
+            ratio = current.ratio / previous.ratio
+            if not (self.min_aspect_ratio <= ratio <= self.max_aspect_ratio):
+                return False
+        return True
 
 
 def require_opencv() -> None:
