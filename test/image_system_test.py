@@ -55,6 +55,7 @@ def result_payload(image_path: Path, frame_shape, result) -> dict:
         "filtered_rects": result.filtered_rect_details,
         "center_rects": result.center_rect_details,
         "closest_rect": result.closest_rect_details,
+        "closest_offset_xy": result.closest_offset_xy,
         "has_hsv_target": result.has_hsv_target,
         "has_final_target": result.has_final_target,
     }

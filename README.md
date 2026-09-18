@@ -8,7 +8,9 @@
 - 按矩形框面积占整张图的比例过滤
 - 用“整幅画面等比例缩小后的居中矩形”作为可调中心区域
 - 从面积过滤后、且落入中心区域的矩形框中选择最接近画面中心点的目标
+- 以图传中心点为 `(0, 0)` 计算最终最近框中心点的中央坐标系偏移，右/上为正，左/下为负
 - GUI 默认显示画面正中央十字准星，并可用开关隐藏，便于判断目标离中心点的距离
+- Tkinter GUI 会在右侧工具栏顶部显示中央坐标系偏移，并通过 FastAPI 暴露 `/get-offset-xy`
 - 支持右侧按钮进入取色模式，鼠标移动实时预览颜色，左键确认后自动设置 HSV 阈值
 - 摄像头模式默认使用后台线程持续取最新帧，降低取帧阻塞造成的延迟
 - 支持降低处理分辨率来提升 FPS，并把矩形框坐标映射回原图尺寸
@@ -46,6 +48,26 @@ Tkinter GUI 使用 Python 标准库 `tkinter/ttk`，比 Qt 更轻，适合作为
 ```bash
 python3 tk_hsv_detector.py --camera 0 --process-scale 0.75 --center-region-ratio 0.5
 ```
+
+启动后会同时启动本地 FastAPI 接口，默认地址为：
+
+```text
+http://127.0.0.1:8000/get-offset-xy
+```
+
+接口返回当前“最终最近框”在中央坐标系下的偏移量，例如：
+
+```json
+{"x-offset":50,"y-offset":50}
+```
+
+如果当前没有最终最近框，接口返回：
+
+```json
+{"x-offset":null,"y-offset":null}
+```
+
+可以用 `--api-host` 和 `--api-port` 修改接口监听地址。这个偏移量使用原始图像像素宽高计算，不使用 GUI 缩放后的显示尺寸，因此不同电脑窗口大小、屏幕分辨率不同，也不会改变同一输入画面下的偏移结果。
 
 轻量 GUI 打开图片测试：
 
@@ -210,9 +232,11 @@ print("全部矩形框:", result.all_rect_details)
 print("像素面积过滤后的矩形框:", result.filtered_rect_details)
 print("中心区域内的候选矩形框:", result.center_rect_details)
 print("最接近画面中心的矩形框:", result.closest_rect_details)
+print("中央坐标系偏移:", result.closest_offset_xy)
 ```
 
 矩形框详情格式是 `(x, y, w, h, area)`，其中 `area = w * h`，单位是像素。
+中央坐标系偏移格式是 `(x, y)`，单位同样是原始图像像素；右和上为正，左和下为负。
 
 ## 新增或修改图像处理流程
 

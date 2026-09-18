@@ -46,6 +46,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on local env
 else:
     _PIL_IMPORT_ERROR = None
 
+try:
+    from fastapi import FastAPI
+    import uvicorn
+except ModuleNotFoundError as exc:  # pragma: no cover - depends on local env
+    FastAPI = None
+    uvicorn = None
+    _FASTAPI_IMPORT_ERROR = exc
+else:
+    _FASTAPI_IMPORT_ERROR = None
+
 from hsv_detector import (
     DEFAULT_LOWER_HSV,
     DEFAULT_UPPER_HSV,
@@ -88,6 +98,8 @@ class AppState:
     s_pick_tol: int = 60
     v_pick_tol: int = 60
     print_interval: float = 0.5
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
 
 
 @dataclass(frozen=True)
@@ -182,13 +194,50 @@ class LatestQueue:
             return None
 
 
+class OffsetState:
+    def __init__(self) -> None:
+        self._offset_xy: Optional[tuple[int, int]] = None
+        self._lock = threading.Lock()
+
+    def set(self, offset_xy: Optional[tuple[int, int]]) -> None:
+        with self._lock:
+            self._offset_xy = offset_xy
+
+    def get(self) -> Optional[tuple[int, int]]:
+        with self._lock:
+            return self._offset_xy
+
+    def payload(self) -> dict[str, Optional[int]]:
+        offset_xy = self.get()
+        if offset_xy is None:
+            return {"x-offset": None, "y-offset": None}
+        return {"x-offset": int(offset_xy[0]), "y-offset": int(offset_xy[1])}
+
+
+def create_offset_api(offset_state: OffsetState) -> FastAPI:
+    app = FastAPI(title="HSV Offset API")
+
+    @app.get("/get-offset-xy")
+    def get_offset_xy() -> dict[str, Optional[int]]:
+        return offset_state.payload()
+
+    return app
+
+
 class VideoWorker(threading.Thread):
-    def __init__(self, state: AppState, frame_queue: LatestQueue, event_queue: LatestQueue) -> None:
+    def __init__(
+        self,
+        state: AppState,
+        frame_queue: LatestQueue,
+        event_queue: LatestQueue,
+        offset_state: OffsetState,
+    ) -> None:
         super().__init__(daemon=True)
         self._state = state
         self._state_lock = threading.Lock()
         self._frame_queue = frame_queue
         self._event_queue = event_queue
+        self._offset_state = offset_state
         self._latest_raw_frame = None
         self._latest_raw_frame_lock = threading.Lock()
         self._running = threading.Event()
@@ -340,6 +389,7 @@ class VideoWorker(threading.Thread):
 
             try:
                 result = detect_objects(frame, state.config)
+                self._offset_state.set(result.closest_offset_xy)
                 display = render_frame(frame, result, state)
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
                 raw_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -358,6 +408,7 @@ class VideoWorker(threading.Thread):
                     "filtered_rects": result.filtered_rect_details,
                     "center_rects": result.center_rect_details,
                     "closest_rect": result.closest_rect_details,
+                    "closest_offset_xy": result.closest_offset_xy,
                     "has_hsv_target": bool(result.all_rects),
                     "has_final_target": result.closest_rect is not None,
                     "hsv_low": state.config.lower_hsv,
@@ -375,6 +426,8 @@ class VideoWorker(threading.Thread):
                     result.center_rect_details,
                     "closest_rect=",
                     result.closest_rect_details,
+                    "closest_offset_xy=",
+                    result.closest_offset_xy,
                     "has_hsv_target=",
                     bool(result.all_rects),
                     flush=True,
@@ -446,6 +499,16 @@ def render_frame(frame, result, state: AppState):
             1,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            display,
+            f"center={result.closest_offset_xy}",
+            (box.x, min(frame.shape[0] - 8, box.y2 + 38)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
 
     return display
 
@@ -510,7 +573,10 @@ class App(tk.Tk):
 
         self.frame_queue = LatestQueue()
         self.event_queue = LatestQueue()
-        self.worker = VideoWorker(initial_state, self.frame_queue, self.event_queue)
+        self.offset_state = OffsetState()
+        self.worker = VideoWorker(initial_state, self.frame_queue, self.event_queue, self.offset_state)
+        self.api_url = self._api_url(initial_state.api_host, initial_state.api_port)
+        self.api_server = self._start_api_server(initial_state.api_host, initial_state.api_port)
 
         self.photo = None
         self.last_rgb = None
@@ -526,6 +592,7 @@ class App(tk.Tk):
         self.preview_hsv: Optional[tuple[int, int, int]] = None
         self.preview_rgb: Optional[tuple[int, int, int]] = None
         self.preview_xy: Optional[tuple[int, int]] = None
+        self.offset_text = "(X,Y)"
 
         self.source_mode = tk.StringVar(value=initial_state.source_mode)
         self.camera_var = tk.IntVar(value=initial_state.camera_index)
@@ -575,6 +642,7 @@ class App(tk.Tk):
         self.video_canvas.bind("<Configure>", self._on_video_area_resize)
         self._show_video_message("等待视频画面")
 
+        self._offset_display(panel)
         self._source_controls(panel)
         self._display_controls(panel)
         self._hsv_controls(panel, state.config)
@@ -587,6 +655,27 @@ class App(tk.Tk):
         self.bind("<plus>", lambda _event: self._zoom(10))
         self.bind("<equal>", lambda _event: self._zoom(10))
         self.bind("<minus>", lambda _event: self._zoom(-10))
+
+    def _api_url(self, host: str, port: int) -> str:
+        display_host = "127.0.0.1" if host == "0.0.0.0" else host
+        return f"http://{display_host}:{port}/get-offset-xy"
+
+    def _start_api_server(self, host: str, port: int):
+        if FastAPI is None or uvicorn is None:
+            return None
+
+        app = create_offset_api(self.offset_state)
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, name="offset-api", daemon=True)
+        thread.start()
+        return server
 
     def _create_scrollable_panel(self, root):
         outer = ttk.Frame(root, style="Panel.TFrame", width=380)
@@ -637,6 +726,69 @@ class App(tk.Tk):
         frame.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(frame, text=title, style="Title.TLabel").pack(anchor=tk.W, pady=(0, 6))
         return frame
+
+    def _offset_display(self, parent) -> None:
+        frame = ttk.Frame(parent, style="Panel.TFrame", padding=(0, 0, 0, 12))
+        frame.pack(fill=tk.X, pady=(0, 10))
+        self.offset_canvas = tk.Canvas(frame, height=58, bg="#ffffff", highlightthickness=0, bd=0)
+        self.offset_canvas.pack(fill=tk.X)
+        self.offset_canvas.bind("<Configure>", lambda _event: self._draw_offset_badge())
+        self.api_text = tk.StringVar(value=f"接口：{self.api_url}")
+        tk.Label(
+            frame,
+            textvariable=self.api_text,
+            bg="#ffffff",
+            fg="#2563eb",
+            font=("Arial", 10, "bold"),
+            anchor=tk.W,
+            wraplength=330,
+        ).pack(fill=tk.X, pady=(5, 0))
+        self._draw_offset_badge()
+
+    def _draw_rounded_rect(
+        self,
+        canvas: tk.Canvas,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        radius: int,
+        **kwargs,
+    ) -> None:
+        radius = max(1, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+        canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, style=tk.ARC, **kwargs)
+        canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, style=tk.ARC, **kwargs)
+        canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, style=tk.ARC, **kwargs)
+        canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, style=tk.ARC, **kwargs)
+        canvas.create_line(x1 + radius, y1, x2 - radius, y1, **kwargs)
+        canvas.create_line(x2, y1 + radius, x2, y2 - radius, **kwargs)
+        canvas.create_line(x1 + radius, y2, x2 - radius, y2, **kwargs)
+        canvas.create_line(x1, y1 + radius, x1, y2 - radius, **kwargs)
+
+    def _draw_offset_badge(self) -> None:
+        if not hasattr(self, "offset_canvas"):
+            return
+        canvas = self.offset_canvas
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        self._draw_rounded_rect(
+            canvas,
+            2,
+            2,
+            width - 3,
+            height - 3,
+            14,
+            fill="#2563eb",
+            width=3,
+        )
+        canvas.create_text(
+            width // 2,
+            height // 2,
+            text=self.offset_text,
+            fill="#2563eb",
+            font=("Arial", 22, "bold"),
+        )
 
     def refresh_cameras(self, show_status: bool = True) -> None:
         if show_status:
@@ -908,6 +1060,8 @@ class App(tk.Tk):
     def stop_camera(self) -> None:
         self.source_mode.set("idle")
         self.worker.update_state(source_mode="idle", image_path=None)
+        self.offset_state.set(None)
+        self._set_offset_text(None)
         self.last_rgb = None
         self.last_raw_rgb = None
         self.last_image_size = (0, 0)
@@ -1090,8 +1244,10 @@ class App(tk.Tk):
 
             if frame_item["has_final_target"]:
                 self.result_vars["closest"].set(f"最终最近框：{frame_item['closest_rect']}")
+                self._set_offset_text(frame_item["closest_offset_xy"])
             else:
                 self.result_vars["closest"].set("最终最近框：无")
+                self._set_offset_text(None)
 
         event_item = self.event_queue.get_nowait()
         if event_item is not None:
@@ -1125,6 +1281,13 @@ class App(tk.Tk):
             self.status_var.set("画面更新正常")
         except Exception as exc:
             self._show_error(f"GUI显示帧失败：{exc}", traceback.format_exc())
+
+    def _set_offset_text(self, offset_xy: Optional[tuple[int, int]]) -> None:
+        if offset_xy is None:
+            self.offset_text = "(X,Y)"
+        else:
+            self.offset_text = f"({offset_xy[0]}, {offset_xy[1]})"
+        self._draw_offset_badge()
 
     def _fit_video_size(self, image_w: int, image_h: int) -> tuple[int, int]:
         canvas_w = max(1, self.video_canvas.winfo_width())
@@ -1181,6 +1344,8 @@ class App(tk.Tk):
         self._push_state()
 
     def on_close(self) -> None:
+        if self.api_server is not None:
+            self.api_server.should_exit = True
         self.worker.stop()
         self.worker.join(timeout=1.2)
         self.destroy()
@@ -1191,6 +1356,8 @@ def require_runtime() -> None:
         raise SystemExit("OpenCV 未安装，请先执行：python3 -m pip install -r requirements.txt") from _CV_IMPORT_ERROR
     if _PIL_IMPORT_ERROR is not None:
         raise SystemExit("Pillow 未安装，请先执行：python3 -m pip install -r requirements.txt") from _PIL_IMPORT_ERROR
+    if _FASTAPI_IMPORT_ERROR is not None:
+        raise SystemExit("FastAPI 未安装，请先执行：python3 -m pip install -r requirements.txt") from _FASTAPI_IMPORT_ERROR
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1206,6 +1373,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hsv-low", type=parse_hsv_triplet, default=DEFAULT_LOWER_HSV)
     parser.add_argument("--hsv-high", type=parse_hsv_triplet, default=DEFAULT_UPPER_HSV)
     parser.add_argument("--print-interval", type=float, default=0.5)
+    parser.add_argument("--api-host", default="127.0.0.1", help="FastAPI host for /get-offset-xy.")
+    parser.add_argument("--api-port", type=int, default=8000, help="FastAPI port for /get-offset-xy.")
     return parser
 
 
@@ -1230,6 +1399,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             center_region_ratio=clamp_center_region_ratio(args.center_region_ratio),
         ),
         print_interval=args.print_interval,
+        api_host=args.api_host,
+        api_port=args.api_port,
     )
 
     app = App(state)

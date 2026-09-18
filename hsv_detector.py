@@ -17,6 +17,7 @@ The public function to reuse from other code is:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import threading
 import time
@@ -145,6 +146,7 @@ class DetectionResult:
     filtered_rects: list[BoundingBox]
     center_rects: list[BoundingBox]
     closest_rect: Optional[BoundingBox]
+    closest_offset_xy: Optional[tuple[int, int]]
 
     @property
     def all_rect_coords(self) -> list[tuple[int, int, int, int]]:
@@ -366,6 +368,29 @@ def choose_closest_to_center(
     )
 
 
+def round_pixel_offset(value: float) -> int:
+    if value >= 0:
+        return int(math.floor(value + 0.5))
+    return int(math.ceil(value - 0.5))
+
+
+def center_coordinate_offset(
+    box: Optional[BoundingBox], frame_shape: Sequence[int]
+) -> Optional[tuple[int, int]]:
+    """Return box center offset in image pixels using center-origin coordinates."""
+    if box is None:
+        return None
+
+    frame_h, frame_w = frame_shape[:2]
+    frame_cx = frame_w / 2.0
+    frame_cy = frame_h / 2.0
+    box_cx, box_cy = box.center
+    return (
+        round_pixel_offset(box_cx - frame_cx),
+        round_pixel_offset(frame_cy - box_cy),
+    )
+
+
 def detect_objects(frame: Any, config: DetectionConfig) -> DetectionResult:
     """Return all boxes, size-filtered boxes, and the center-nearest box."""
     require_opencv()
@@ -394,7 +419,15 @@ def detect_objects(frame: Any, config: DetectionConfig) -> DetectionResult:
     filtered_rects = filter_boxes_by_area(all_rects, frame.shape, config)
     center_rects = filter_boxes_by_center_region(filtered_rects, frame.shape, config)
     closest_rect = choose_closest_to_center(center_rects, frame.shape)
-    return DetectionResult(mask, all_rects, filtered_rects, center_rects, closest_rect)
+    closest_offset_xy = center_coordinate_offset(closest_rect, frame.shape)
+    return DetectionResult(
+        mask,
+        all_rects,
+        filtered_rects,
+        center_rects,
+        closest_rect,
+        closest_offset_xy,
+    )
 
 
 def parse_hsv_triplet(raw: str) -> tuple[int, int, int]:
@@ -909,6 +942,16 @@ def draw_detections(
             1,
             cv2.LINE_AA,
         )
+        cv2.putText(
+            display,
+            f"center={result.closest_offset_xy}",
+            (box.x, min(frame.shape[0] - 8, box.y2 + 38)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
 
     display = resize_for_display(display, display_scale)
     view_label = "HSV掩膜" if display_mask else "原画面"
@@ -925,6 +968,7 @@ def draw_detections(
             f"面积过滤后={result.filtered_rect_details}",
             f"中心候选框={result.center_rect_details}",
             f"最终最近框={result.closest_rect_details if result.has_final_target else '无'}",
+            f"中央坐标系偏移={result.closest_offset_xy if result.closest_offset_xy is not None else '(X,Y)'}",
             picker_text,
             "按键：q退出 | m切换画面/掩膜 | b切换框 | +/-缩放显示 | c/p切换摄像头 | 0-9选摄像头",
         ],
@@ -943,6 +987,8 @@ def print_detection_result(result: DetectionResult) -> None:
         result.center_rect_details,
         "closest_rect=",
         result.closest_rect_details,
+        "closest_offset_xy=",
+        result.closest_offset_xy,
         "has_hsv_target=",
         result.has_hsv_target,
         "has_final_target=",
