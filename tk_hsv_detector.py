@@ -12,10 +12,12 @@ This is the recommended GUI for algorithm testing:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import platform
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -76,12 +78,101 @@ APP_TITLE = "HSV 轻量测试工具"
 MAX_CAMERA_SCAN_INDEX = 9
 CONFIG_SCHEMA_VERSION = 1
 DEFAULT_CONFIG_NAME = "default.json"
+WILDCARD_API_HOSTS = {"", "0.0.0.0", "::"}
 
 
 def pil_bilinear_resample():
     if hasattr(Image, "Resampling"):
         return Image.Resampling.BILINEAR
     return Image.BILINEAR
+
+
+def is_displayable_lan_ipv4(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return (
+        ip.version == 4
+        and not ip.is_loopback
+        and not ip.is_unspecified
+        and not ip.is_multicast
+        and not ip.is_link_local
+    )
+
+
+def get_lan_ipv4() -> str:
+    candidates: list[str] = []
+
+    def add_candidate(address: str) -> None:
+        if is_displayable_lan_ipv4(address) and address not in candidates:
+            candidates.append(address)
+
+    def add_command_addresses(command: Sequence[str]) -> None:
+        try:
+            result = subprocess.run(
+                list(command),
+                capture_output=True,
+                text=True,
+                timeout=0.8,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        for address in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", result.stdout):
+            add_candidate(address)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            add_candidate(probe.getsockname()[0])
+    except OSError:
+        pass
+
+    system_name = platform.system()
+    if system_name == "Darwin":
+        try:
+            route = subprocess.run(
+                ["route", "-n", "get", "default"],
+                capture_output=True,
+                text=True,
+                timeout=0.8,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            route = None
+        if route is not None:
+            match = re.search(r"interface:\s*(\S+)", route.stdout)
+            if match:
+                add_command_addresses(["ipconfig", "getifaddr", match.group(1)])
+        for interface in ("en0", "en1", "en2", "en3", "en4", "en5"):
+            add_command_addresses(["ipconfig", "getifaddr", interface])
+        add_command_addresses(["ifconfig"])
+    elif system_name == "Linux":
+        add_command_addresses(["hostname", "-I"])
+        add_command_addresses(["ip", "-4", "addr", "show", "scope", "global"])
+    elif system_name == "Windows":
+        add_command_addresses(["ipconfig"])
+
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_DGRAM):
+            add_candidate(info[4][0])
+    except OSError:
+        pass
+
+    private_candidates = [address for address in candidates if ipaddress.ip_address(address).is_private]
+    if private_candidates:
+        return private_candidates[0]
+    if candidates:
+        return candidates[0]
+    return "127.0.0.1"
+
+
+def display_api_host(host: str) -> str:
+    if host.strip() in WILDCARD_API_HOSTS:
+        return get_lan_ipv4()
+    return host
 
 
 @dataclass(frozen=True)
@@ -102,8 +193,8 @@ class AppState:
     s_pick_tol: int = 60
     v_pick_tol: int = 60
     print_interval: float = 0.5
-    api_host: str = "127.0.0.1"
-    api_port: int = 8000
+    api_host: str = "0.0.0.0"
+    api_port: int = 8005
 
 
 @dataclass(frozen=True)
@@ -903,7 +994,7 @@ class App(tk.Tk):
         self.bind("<minus>", lambda _event: self._zoom(-10))
 
     def _api_url(self, host: str, port: int) -> str:
-        display_host = "127.0.0.1" if host == "0.0.0.0" else host
+        display_host = display_api_host(host)
         base_url = f"http://{display_host}:{port}"
         return f"{base_url}/get-offset-xy | {base_url}/if-obj-stable"
 
