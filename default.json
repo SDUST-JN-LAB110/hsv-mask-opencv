@@ -7,29 +7,29 @@
   "box_mode": "all",
   "show_center_region": true,
   "show_reticle": true,
-  "display_scale": 1.0,
-  "pick_radius": 4,
+  "display_scale": 0.9,
+  "pick_radius": 0,
   "h_pick_tol": 10,
   "s_pick_tol": 60,
   "v_pick_tol": 60,
   "print_interval": 0.5,
   "detection": {
     "lower_hsv": [
-      111,
-      130,
-      40
+      168,
+      195,
+      87
     ],
     "upper_hsv": [
-      131,
-      250,
-      157
+      8,
+      255,
+      207
     ],
-    "min_area_px": 4000,
-    "max_area_px": 10000,
-    "frame_blur_kernel": 5,
-    "mask_median_kernel": 5,
-    "morph_kernel": 5,
-    "open_iterations": 1,
+    "min_area_px": 90,
+    "max_area_px": 3000,
+    "frame_blur_kernel": 0,
+    "mask_median_kernel": 0,
+    "morph_kernel": 0,
+    "open_iterations": 0,
     "close_iterations": 2,
     "process_scale": 0.75,
     "center_region_ratio": 1.0
